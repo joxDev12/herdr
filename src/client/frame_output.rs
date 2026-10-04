@@ -71,7 +71,42 @@ pub(super) fn write_composed_frame(
                     let path = base64::engine::general_purpose::STANDARD.encode(path.as_bytes());
                     write!(writer, "\x1b_G{control};{path}\x1b\\")?;
                 } else {
-                    crate::kitty_graphics::write_kitty_data(&mut writer, control, data)?;
+                    let fields = control.split(',').collect::<Vec<_>>();
+                    let field = |key: &str| fields.iter().find_map(|part| part.strip_prefix(key));
+                    let format = field("f=");
+                    let dimensions = field("s=").and_then(|s| s.parse::<u32>().ok())
+                        .zip(field("v=").and_then(|v| v.parse::<u32>().ok()));
+                    if let Some((width, height)) = dimensions.filter(|_| {
+                        matches!(format, Some("24" | "32"))
+                            && data.len() >= 1024
+                            && field("o=").is_none()
+                    }) {
+                        let mut compressed = Vec::new();
+                        let mut encoder = png::Encoder::new(&mut compressed, width, height);
+                        encoder.set_color(if format == Some("32") {
+                            png::ColorType::Rgba
+                        } else {
+                            png::ColorType::Rgb
+                        });
+                        encoder.set_depth(png::BitDepth::Eight);
+                        encoder.set_compression(png::Compression::Fast);
+                        encoder.set_filter(png::FilterType::Paeth);
+                        let mut image = encoder.write_header().map_err(io::Error::other)?;
+                        image.write_image_data(data).map_err(io::Error::other)?;
+                        image.finish().map_err(io::Error::other)?;
+                        if compressed.len() < data.len() {
+                            let control = fields.iter().map(|part| {
+                                if part.starts_with("f=") { "f=100" } else { part }
+                            }).collect::<Vec<_>>().join(",");
+                            crate::kitty_graphics::write_kitty_data(
+                                &mut writer, &control, &compressed,
+                            )?;
+                        } else {
+                            crate::kitty_graphics::write_kitty_data(&mut writer, control, data)?;
+                        }
+                    } else {
+                        crate::kitty_graphics::write_kitty_data(&mut writer, control, data)?;
+                    }
                 }
             }
         }
